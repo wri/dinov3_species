@@ -7,24 +7,24 @@ from rasterio.transform import Affine
 from PIL import Image
 import torch
 import torchvision.transforms.functional as TF
-from dinov3.hub.backbones import dinov3_vitl16  # or dinov3_vit7b16 if you prefer
+from dinov3.hub.backbones import dinov3_vitb16 #dinov3_vitl16  # or dinov3_vit7b16 if you prefer
 from sklearn.decomposition import PCA
+import time
 
-# ------------ USER KNOBS ------------
 INPUT_TIF    = "../data/msu_images/cerath_2023-10-01.tif"
-SPATIAL_WIN  = 1536                    # non-overlap chip size (px)
+SPATIAL_WIN  = 768                    # non-overlap chip size (px)
 READ_MASKED  = False                   # set True to honor nodata
 PATCH_SIZE   = 16                      # DINO token stride in pixels
-IMAGE_SIZE   = 1536                    # resize target height (px)
+IMAGE_SIZE   = 768                    # resize target height (px)
 MEAN = (0.430, 0.411, 0.296)
 STD  = (0.213, 0.156, 0.143)
-N_LAYERS = 24                          # number of intermediate layers to request; we use the last one
+N_LAYERS = 12                          # number of intermediate layers to request; we use the last one (24 for vit-L/16)
 N_PC     = 3                           # write first 3 PCs
 IPCA_BATCH = 20000                     # tokens per partial_fit batch (tune for RAM)
-TARGET_SAMPLE = 300_000
-RNG = np.random.default.rng(0)
+TARGET_SAMPLE = 10_000
+RNG = np.random.default_rng(0)         # 0 is a seed to ensure PCA gets same sample subset
 
-# ------------ Preprocessing (unchanged logic) ------------
+
 def resize_transform(mask_image: Image.Image,
                      image_size: int = IMAGE_SIZE,
                      patch_size: int = PATCH_SIZE) -> torch.Tensor:
@@ -40,7 +40,10 @@ def resize_transform(mask_image: Image.Image,
     return TF.to_tensor(TF.resize(mask_image, (out_h, out_w)))
 
 def build_windows(src, spatial_win=SPATIAL_WIN):
-    """Non-overlapping windows that tile the raster (edge windows are clipped)."""
+    """
+    Build non-overlapping windows that tile the raster 
+    (edge windows are clipped).
+    """
     h, w = src.height, src.width
     rows = range(0, h, spatial_win)
     cols = range(0, w, spatial_win)
@@ -83,7 +86,14 @@ def window_to_tensor(src, win: Window) -> torch.Tensor:
 
 def infer_pipe(image_path: str):
 
-    model = dinov3_vitl16(pretrained=False).eval()
+    '''
+    Loads dinov3 model
+    Builds windows
+    Samples entire image to fit PCA
+    Applies
+    '''
+
+    model = dinov3_vitb16(pretrained=False).eval()
 
     with rasterio.open(image_path) as src:
         print("=== Source ===")
@@ -94,7 +104,7 @@ def infer_pipe(image_path: str):
         print("Bands:", src.count)
         print()
 
-        # Build windows (non-overlapping)
+        # Build windows
         windows = build_windows(src, spatial_win=SPATIAL_WIN)
         print(f"Built {len(windows)} non-overlapping windows (tile={SPATIAL_WIN}px)")
 
@@ -104,22 +114,28 @@ def infer_pipe(image_path: str):
         tokens_per_window = max(1, TARGET_SAMPLE // max(1, len(windows)))
         sample_buf = []
 
+        start_batch_time = time.time()
+
         for i, win in enumerate(windows, 1):
             x = window_to_tensor(src, win).unsqueeze(0)  # (1,3,H*,W*)
             with torch.inference_mode():
                 feats = model.get_intermediate_layers(x, n=range(N_LAYERS), reshape=True, norm=True)
                 f = feats[-1].squeeze(0)                 # (Htok, Wtok, C)
             Ht, Wt, C = f.shape
-            tokens = f.reshape(Ht * Wt, C).detach().cpu().numpy().astype(np.float32)  # (Nt, C)
+            tokens = f.reshape(Ht * Wt, C).detach().cpu().numpy().astype(np.float32, copy=False)  # (Nt, C)
 
-            Nt = tokens.shape[0]
+            Nt = tokens.shape[0] #number of tokens extracted from that window 96x96 = 9,216
             take = min(Nt, tokens_per_window)
             if take > 0:
                 idx = RNG.choice(Nt, size=take, replace=False)
                 sample_buf.append(tokens[idx])
 
             if i % 10 == 0:
-                print(f"[sample] processed {i}/{len(windows)} windows")
+                elapsed = time.time() - start_batch_time
+                avg_per_win = elapsed / 10
+                print(f"Processed {i:04d}/{len(windows)} windows "
+                    f"→ batch took {elapsed:.1f}s (avg {avg_per_win:.2f}s/window)")
+                start_batch_time = time.time()
 
         if not sample_buf:
             raise RuntimeError("Sampling produced no tokens; check inputs/windows.")
@@ -127,12 +143,12 @@ def infer_pipe(image_path: str):
         sample = np.concatenate(sample_buf, axis=0)  # (~TARGET_SAMPLE, C)
         print(f"Fitting PCA on {sample.shape[0]:,} tokens (dim={sample.shape[1]}) ...")
 
-        pca = PCA(n_components=N_PC, svd_solver="randomized", whiten=True, random_state=0)
+        pca = PCA(n_components=N_PC, svd_solver="randomized", whiten=False, random_state=0)
         pca.fit(sample)
         print("PCA fitted.")
 
         # -------------------------------------------------------
-        # Prepare output GeoTIFF at patch (token) resolution
+        # Prepare output GeoTIFF 
         # -------------------------------------------------------
         H, W = src.height, src.width
         out_h = math.ceil(H / PATCH_SIZE)
@@ -166,7 +182,7 @@ def infer_pipe(image_path: str):
             # PASS 2: Transform each window → viz → write
             # ------------------------------------------------
             for i, win in enumerate(windows, 1):
-                # location in token grid
+                # compute location in token grid
                 y0_tok = win.row_off // PATCH_SIZE
                 x0_tok = win.col_off // PATCH_SIZE
 
@@ -174,7 +190,7 @@ def infer_pipe(image_path: str):
                 with torch.inference_mode():
                     f = model.get_intermediate_layers(x, n=range(N_LAYERS), reshape=True, norm=True)[-1].squeeze(0)
                 Ht, Wt, C = f.shape
-                tokens = f.reshape(Ht * Wt, C).detach().cpu().numpy().astype(np.float32)  # (Nt, C)
+                tokens = f.reshape(Ht * Wt, C).detach().cpu().numpy().astype(np.float32, copy=False)  # (Nt, C)
 
                 # PCs (neg/pos) → your viz mapping: *2 → sigmoid → [0,1] → uint8
                 pcs = pca.transform(tokens).astype(np.float32).reshape(Ht, Wt, N_PC)  # (Ht, Wt, 3)
