@@ -111,11 +111,12 @@ def combine_projects(
                 if drop_zero_latlon and lat_col in gdf.columns and lon_col in gdf.columns:
                     gdf = gdf[(gdf[lat_col] != 0) & (gdf[lon_col] != 0)]
 
-                gdf["project"] = key
+                gdf["project_na"] = key
 
-                keep_cols = ['SID','PID','Date','TreeID','Lat_T','Long_T',
+                keep_cols = ['SID','project_na','PID',
+                             'Date','TreeID','Lat_T','Long_T',
                 'Species','Cluster','DBH__cm_','Crown_D_Ma',
-                'Crown_D_90','Height','Remarks','geometry','project']
+                'Crown_D_90','Height','Remarks','geometry',]
                 wanted = [c for c in keep_cols if c in gdf.columns] 
                 gdf = gdf.loc[:, wanted]
                 combined_frames.append(gdf)
@@ -142,61 +143,6 @@ def combine_projects(
     combined.to_file(outfile)
 
     return combined
-
-
-def species_eda(
-    gdf: gpd.GeoDataFrame,
-    none_tokens: Iterable[str] = ("none",),   # strings to treat as missing (case-insensitive)
-    treat_blank_as_na: bool = True,           # drop '' and whitespace-only as missing
-    normalize_case: bool = True               # store normalized species as lowercase
-):
-    """
-    EDA + cleaning for the species column.
-
-    Steps:
-      1) Count rows where species is NaN or one of none_tokens (case-insensitive), plus optional blanks.
-      2) Drop those rows.
-      3) Report the number of unique species remaining (case-insensitive).
-    Returns cleaned GeoDataFrame and a summary report dict.
-    """
-    df = gdf.copy()
-    nan_count = df['species'].isna().sum()
-
-    # Build a normalized text version for checks
-    sp_norm = df['species'].astype(str).str.strip().str.lower()
-
-    # Identify rows that should be treated as missing based on tokens/blank
-    none_set = {t.lower() for t in none_tokens}
-    is_none_token = sp_norm.isin(none_set)
-    is_blank = sp_norm.eq("") if treat_blank_as_na else pd.Series(False, index=df.index)
-
-    # Rows to drop: NaN OR token OR blank
-    to_drop_mask = df['species'].isna() | is_none_token | is_blank
-    none_count = is_none_token.sum()
-    blank_count = is_blank.sum() if treat_blank_as_na else 0
-    drop_count = to_drop_mask.sum()
-    df = df.loc[~to_drop_mask].copy()
-
-    # Optionally normalize case in the species column for consistency
-    if normalize_case:
-        df['species'] = df['species'].astype(str).str.strip().str.lower()
-
-    # Count unique species across all remaining rows (case-insensitive via normalization)
-    unique_species = df['species'].nunique(dropna=True)
-
-    report = {
-        "nan_rows": int(nan_count),
-        "none_rows": int(none_count),
-        "blank_rows": int(blank_count),
-        "dropped_rows_total": int(drop_count),
-        "rows_after_clean": int(len(df)),
-        "unique_species_count": int(unique_species),
-
-    }
-
-    return df, report
-
-    
 
 
 def _normalize_species_string(s: str) -> str | None:
@@ -234,17 +180,18 @@ def _normalize_species_string(s: str) -> str | None:
     return s or None
 
 
-def normalize_species_column(
+def clean_species_column(
     df: pd.DataFrame,
     species_col: str = "species",
     keep_original: bool = True,
-    genus_initial_map: dict[str, str] | None = None,   # e.g. {'p': 'persea', 'g': 'grevillea', 'm': 'mangifera'}
-    known_fixes: dict[str, str] | None = None          # e.g. {'grevillea robutsa':'grevillea robusta'}
+    genus_initial_map: dict[str, str] | None = None,   
+    known_fixes: dict[str, str] | None = None         
 ) -> pd.DataFrame:
     """
     Create df['species_norm'] with simplified, documented normalization.
     Optionally:
-      - Expand genus initials like 'p. americana' using genus_initial_map.
+      - Expand genus initials like 'p. americana' using genus_initial_map. 
+        e.g. {'p': 'persea', 'g': 'grevillea', 'm': 'mangifera'} (not using)
       - Apply a curated known_fixes dict after normalization.
 
     Returns a copy so the operation is reversible and easy to audit.
@@ -256,7 +203,7 @@ def normalize_species_column(
     # Base normalization
     out["species_norm"] = out[species_col].map(_normalize_species_string)
 
-    # Optional: expand genus initials (only when pattern looks like 'x. epithet')
+    # Optional: expand genus initials 
     if genus_initial_map:
         pattern = re.compile(r"^([a-z])\.\s*([a-z]+)$")
         def _expand_initial(val):
@@ -273,59 +220,100 @@ def normalize_species_column(
     # Optional curated fixes (run AFTER expansions)
     if known_fixes:
         out["species_norm"] = out["species_norm"].replace(known_fixes)
-
+    
+    out.drop(columns="species", errors="ignore", inplace=True)
     return out
 
-
-def suggest_species_merges(
-    series: pd.Series,
-    min_similarity: float = 0.88,
-    by_genus: bool = True,
-    min_count: int = 1,
-) -> pd.DataFrame:
+def clean_report_species(
+    gdf: gpd.GeoDataFrame,
+    none_tokens: Iterable[str] = ("none",),   # strings to treat as missing (case-insensitive)
+    treat_blank_as_na: bool = True,           # drop '' and whitespace-only as missing
+):
     """
-    Suggest merges for near-duplicate names using difflib similarity.
-    - by_genus: only compare names sharing the same first token (safer).
-    - min_count: ignore rare forms below this frequency.
-    Returns a tidy DataFrame with counts and similarity scores.
+    EDA + cleaning for the species column.
+
+    Steps:
+      1) Count rows where species is NaN or one of none_tokens (case-insensitive), 
+        plus optional blanks.
+      2) Drop those rows.
+      3) Report the number of unique species remaining (case-insensitive).
+  
     """
-    s = series.dropna().astype(str)
-    vc = s.value_counts()
-    candidates = vc[vc >= min_count].index.tolist()
+    df = gdf.copy()
 
-    def genus_of(x): 
-        return x.split()[0] if " " in x else x
+    # work with a separate view of the species column
+    s = df['species']
+    nan_count = s.isna().sum()
 
-    suggestions = []
-    if by_genus:
-        # Compare within genus buckets
-        buckets = {}
-        for name in candidates:
-            buckets.setdefault(genus_of(name), []).append(name)
-        groups = buckets.values()
-    else:
-        groups = [candidates]
+    # normalized text version for checks
+    s_norm = s.astype(str).str.strip().str.lower()
 
-    for group in groups:
-        group = sorted(group, key=lambda x: (-vc[x], x))  # frequent first
-        for i, a in enumerate(group):
-            for b in group[i+1:]:
-                sim = SequenceMatcher(None, a, b).ratio()
-                if sim >= min_similarity:
-                    # Suggest the more frequent spelling as the target
-                    target = a if vc[a] >= vc[b] else b
-                    source = b if target == a else a
-                    suggestions.append({
-                        "source": source,
-                        "target": target,
-                        "similarity": round(sim, 3),
-                        "source_count": int(vc[source]),
-                        "target_count": int(vc[target]),
-                        "genus_bucket": genus_of(a),
-                    })
+    # Identify rows to drop
+    none_set = {t.lower() for t in none_tokens}
+    is_none_token = s_norm.isin(none_set)
+    is_blank = s_norm.eq("") if treat_blank_as_na else pd.Series(False, index=df.index)
 
-    return pd.DataFrame(suggestions).sort_values(
-        ["genus_bucket", "similarity", "target_count", "source_count"],
-        ascending=[True, False, False, False],
-        ignore_index=True
+    to_drop_mask = s.isna() | is_none_token | is_blank
+    none_count = int(is_none_token.sum())
+    blank_count = int(is_blank.sum()) if treat_blank_as_na else 0
+    drop_count = int(to_drop_mask.sum())
+
+    # filter the original DataFrame (not the Series)
+    df_keep = df.loc[~to_drop_mask].copy()
+
+    clean_species = clean_species_column(
+        df_keep,
+        species_col="species",
+        known_fixes={
+            "grevillea robutsa": "grevillea robusta",
+            "mangnifera indica": "mangifera indica",
+            "mangnigera indica": "mangifera indica",
+            "mangefera indica": "mangifera indica",
+            "magnifera indica": "mangifera indica",
+            "magnigera indica": "mangifera indica",
+            "ficus thoningii": "ficus thonningii",
+            "fiscus sur": "ficus sur",
+            "fucus spp": "ficus spp",
+            "markhemia lutea": "markhamia lutea",
+            "sena spectabillis": "senna spectabilis",
+            "sena sepectabilis": "senna spectabilis",
+            "teminalia superba": "terminalia superba",
+            "terminallia sp": "terminalia spp",
+            "acacia nigrens": "acacia nigrescens",
+            "acacia negrens": "acacia nigrescens",
+            "acacia tortillis": "acacia tortilis",
+            "acacia tortilla": "acacia tortilis",
+            "accacia nilotica": "acacia nilotica",
+        },
     )
+
+    new_species = clean_species['species_norm'].nunique(dropna=True)
+    old_species = clean_species['species_raw'].nunique(dropna=True)
+
+    report = {
+        "nan_rows": int(nan_count),
+        "none_rows": none_count,
+        "blank_rows": blank_count,
+        "dropped_rows_total": drop_count,
+        "rows_after_clean": int(clean_species.shape[0]),
+        "unique_species_old": int(old_species),
+        "unique_species_new": int(new_species),
+    }
+    print(report)
+    return clean_species
+
+
+
+def write_clean_shp(df):
+    '''
+    Following aggregate cleaning steps, writes clean
+    individual shp files for each project.
+    '''
+    prj_names = list(set(df.project_na))
+
+    for name in prj_names:
+        prj_df = df[df.project_na == 'name']
+        prj_df.to_file("../data/msu_field/{name}_clean.shp")
+    
+    print(f"Field data for {len(prj_names)} projects cleaned and saved.")
+    return None
