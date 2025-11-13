@@ -7,6 +7,7 @@ import re
 import unicodedata
 from difflib import SequenceMatcher
 import pandas as pd
+from pathlib import Path
 
 def get_msu_projects(src_dir: str = "../data/msu_field/") -> List[str]:
     """
@@ -303,17 +304,19 @@ def clean_report_species(
     return clean_species
 
 
-
-def write_clean_shp(df):
+def write_clean_gpkg(df,
+                     out_dir: str = "../data/msu_field/_clean"):
     '''
     Following aggregate cleaning steps, writes clean
     individual shp files for each project.
     '''
-    prj_names = list(set(df.project_na))
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
 
-    for name in prj_names:
-        prj_df = df[df.project_na == 'name']
-        prj_df.to_file("../data/msu_field/{name}_clean.shp")
-    
-    print(f"Field data for {len(prj_names)} projects cleaned and saved.")
-    return None
+    df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.date
+    n=0
+    for name, prj_df in df.groupby("project_na", dropna=True):
+        prj_df.to_file(f"{out_dir}/{name}_fielddata_clean.gpkg", layer="trees", driver="GPKG")
+        n += 1
+
+    print(f"Field data for {n} projects cleaned and saved in {out_dir}.")
