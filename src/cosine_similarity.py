@@ -139,6 +139,52 @@ def aoi_clip(
     )
 
 
+def validate_inputs(trees_path, 
+                    image_path, 
+                    species_col="species_norm"):
+    """
+    Validate that:
+    1. The tree CRS matches the image CRS (or can be reprojected).
+    2. All tree points fall within the image bounds.
+    3. The tree dataset contains > 1 species.
+
+    Returns:
+        gdf_aligned: GeoDataFrame reprojected to image CRS (safe to use downstream)
+        valid_mask: boolean mask of which rows lie inside the image
+    """
+    gdf = gpd.read_file(trees_path)
+    with rasterio.open(image_path) as src_img:
+        img_crs = src_img.crs
+        img_bounds = src_img.bounds  # (left, bottom, right, top)
+        if gdf.crs is None:
+            raise ValueError("Tree file has no CRS.")
+
+        if gdf.crs != img_crs:
+            print("Reprojecting trees to src_img CRS...")
+            gdf = gdf.to_crs(img_crs)
+
+        xmin, ymin, xmax, ymax = img_bounds
+
+        inside_mask = (
+            (gdf.geometry.x >= xmin) &
+            (gdf.geometry.x <= xmax) &
+            (gdf.geometry.y >= ymin) &
+            (gdf.geometry.y <= ymax)
+        )
+
+        n_outside = (~inside_mask).sum()
+        if n_outside > 0:
+            print(f"Dropping {n_outside} tree points outside the image extent.")
+
+        gdf_valid = gdf[inside_mask].copy()
+
+        # check species diversity
+        unique_species = gdf_valid[species_col].dropna().unique()
+        if len(unique_species) < 2:
+            raise ValueError(f"Only {len(unique_species)} species present at this site")
+
+        return gdf_valid
+
 def per_tree_features(image_path: str,
                       pca_path: str,
                       trees_path: str,
@@ -157,9 +203,15 @@ def per_tree_features(image_path: str,
     model = dinov3_vitb16(pretrained=False).eval()
     trees = gpd.read_file(trees_path)
     records = []
-    print(f"Extracting information for {trees.shape[0]} tree points.")
+
+    trees_valid = validate_inputs(trees_path=trees_path,
+                                  image_path=image_path,
+                                  species_col="species_norm")
+
+    print(f"Extracting information for {len(trees_valid)}/{len(trees)} valid tree points.")
+    
     with rasterio.open(image_path) as src_img, rasterio.open(pca_path) as src_pca:
-        for idx, row in trees.iterrows():
+        for idx, row in trees_valid.iterrows():
             pt: Point = row.geometry
             x, y = pt.x, pt.y
             species = row['species_norm']
@@ -167,7 +219,6 @@ def per_tree_features(image_path: str,
             # ------------------------------------------------
             # Get PCA value at tree location
             # ------------------------------------------------
-            print("Extracting PCA")
             pca_row, pca_col = rowcol(src_pca.transform, x, y)
             pca_vals = src_pca.read(window=Window(pca_col, pca_row, 1, 1)).squeeze()
 
@@ -182,20 +233,20 @@ def per_tree_features(image_path: str,
             col_img = int(np.clip(col_img, 0, src_img.width  - 1))
 
             # Choose a window aligned to IMAGE_SIZE that still contains the point.
-            # We align window top-left to a multiple of PATCH_SIZE for clean token grid alignment.
+            # We align window top-left to a multiple of PATCH_SIZE for clean alignment
             half = IMAGE_SIZE // 2
+            # (r0, c0) computes the top-left corner of the window 
             r0 = max(0, (row_img - half) // PATCH_SIZE * PATCH_SIZE)
             c0 = max(0, (col_img - half) // PATCH_SIZE * PATCH_SIZE)
+            # (r1, c1) computes the bottom right corner 
             r1 = min(src_img.height,  r0 + IMAGE_SIZE)
             c1 = min(src_img.width,   c0 + IMAGE_SIZE)
 
-            # Adjust if near image edges
             r0 = max(0, r1 - IMAGE_SIZE)
             c0 = max(0, c1 - IMAGE_SIZE)
 
             win = Window(c0, r0, c1 - c0, r1 - r0)
 
-            print("Extracting embeddings")
             x_tensor = window_to_tensor(src_img, win).unsqueeze(0)
             # tokens → (Ht*Wt, C)
             tokens, Ht, Wt, Channels = extract_embeddings(model, x_tensor)
@@ -215,10 +266,9 @@ def per_tree_features(image_path: str,
             tr = int(np.clip(np.floor(r_model / PATCH_SIZE), 0, Ht - 1))
             tc = int(np.clip(np.floor(c_model / PATCH_SIZE), 0, Wt - 1))
 
-            # flatten idx
+            # flatten idx: token row (tr) * Wt (num tokens per colum) * token column (tc)
             flat = tr * Wt + tc
-
-            emb_vec = tokens[flat]
+            embed_vec = tokens[flat]
 
             # build the table
             records.append({
@@ -228,7 +278,7 @@ def per_tree_features(image_path: str,
                 "r_tok": int(tr),
                 "c_tok": int(tc),
                 "pca_vec": pca_vals.astype(np.float32),
-                "embed_vec": emb_vec,
+                "embed_vec": embed_vec,
             })
     return records
 
