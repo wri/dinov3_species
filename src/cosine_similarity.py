@@ -13,6 +13,10 @@ from dinov3.hub.backbones import dinov3_vitb16
 from rasterio.windows import Window
 from rasterio.transform import rowcol
 from shapely.geometry import Point
+from collections import Counter
+
+from sklearn.metrics.pairwise import cosine_similarity
+import matplotlib.pyplot as plt
 
 IMAGE_SIZE = 768
 PATCH_SIZE = 16
@@ -188,6 +192,7 @@ def validate_inputs(trees_path,
 def per_tree_features(image_path: str,
                       pca_path: str,
                       trees_path: str,
+                      out_path: str = None,
                         ):
     '''
     loads AOI inputs
@@ -197,16 +202,18 @@ def per_tree_features(image_path: str,
     Builds windows
     Extract dino embedding for window containing tree point
     Read pca closes to tree point
-    Create table with lat, lon, species, token_row, token_col, pca_vec, embed_vec
-    Return table
+    Return table with lat, lon, species, token_row, token_col, pca_vec, embed_vec
     '''
     model = dinov3_vitb16(pretrained=False).eval()
     trees = gpd.read_file(trees_path)
-    records = []
+    records: list[dict] = []
 
-    trees_valid = validate_inputs(trees_path=trees_path,
-                                  image_path=image_path,
-                                  species_col="species_norm")
+    trees_valid = validate_inputs(
+        trees_path=trees_path,
+        image_path=image_path,
+        species_col="species_norm",
+    )
+    print(trees_valid.columns)
 
     print(f"Extracting information for {len(trees_valid)}/{len(trees)} valid tree points.")
     
@@ -214,7 +221,8 @@ def per_tree_features(image_path: str,
         for idx, row in trees_valid.iterrows():
             pt: Point = row.geometry
             x, y = pt.x, pt.y
-            species = row['species_norm']
+            species = row["species_norm"]
+            tree_id = row["treeid"] 
 
             # ------------------------------------------------
             # Get PCA value at tree location
@@ -222,40 +230,43 @@ def per_tree_features(image_path: str,
             pca_row, pca_col = rowcol(src_pca.transform, x, y)
             pca_vals = src_pca.read(window=Window(pca_col, pca_row, 1, 1)).squeeze()
 
+            # ensure PCA vector is float32
+            pca_vals = np.asarray(pca_vals, dtype=np.float32)
+
             # ------------------------------------------------
-            # Extract dino embedding on window that contains tree
+            # Extract DINO embedding on window that contains tree
             # ------------------------------------------------
-            
             # Find the image-space pixel for the point
-            # get rows and cols coordinates given geo coordinates
-            row_img, col_img = rowcol(src_img.transform, x, y)  
+            row_img, col_img = rowcol(src_img.transform, x, y)
             row_img = int(np.clip(row_img, 0, src_img.height - 1))
             col_img = int(np.clip(col_img, 0, src_img.width  - 1))
 
             # Choose a window aligned to IMAGE_SIZE that still contains the point.
-            # We align window top-left to a multiple of PATCH_SIZE for clean alignment
             half = IMAGE_SIZE // 2
-            # (r0, c0) computes the top-left corner of the window 
+
+            # top-left corner of the window (aligned to PATCH_SIZE multiples)
             r0 = max(0, (row_img - half) // PATCH_SIZE * PATCH_SIZE)
             c0 = max(0, (col_img - half) // PATCH_SIZE * PATCH_SIZE)
-            # (r1, c1) computes the bottom right corner 
+
+            # bottom-right corner
             r1 = min(src_img.height,  r0 + IMAGE_SIZE)
             c1 = min(src_img.width,   c0 + IMAGE_SIZE)
 
+            # adjust to keep window full-sized where possible
             r0 = max(0, r1 - IMAGE_SIZE)
             c0 = max(0, c1 - IMAGE_SIZE)
 
             win = Window(c0, r0, c1 - c0, r1 - r0)
 
             x_tensor = window_to_tensor(src_img, win).unsqueeze(0)
-            # tokens → (Ht*Wt, C)
+
             tokens, Ht, Wt, Channels = extract_embeddings(model, x_tensor)
-     
-            # Map tree location to token index which will be tr, tc
+
+            # Map tree location to token index (tr, tc)
             r_off = row_img - r0
             c_off = col_img - c0
 
-            # convert to model input coords (scaled to 768)
+            # convert to model input coords (scaled to IMAGE_SIZE)
             scale_r = IMAGE_SIZE / (r1 - r0)
             scale_c = IMAGE_SIZE / (c1 - c0)
 
@@ -266,19 +277,125 @@ def per_tree_features(image_path: str,
             tr = int(np.clip(np.floor(r_model / PATCH_SIZE), 0, Ht - 1))
             tc = int(np.clip(np.floor(c_model / PATCH_SIZE), 0, Wt - 1))
 
-            # flatten idx: token row (tr) * Wt (num tokens per colum) * token column (tc)
             flat = tr * Wt + tc
             embed_vec = tokens[flat]
 
-            # build the table
+            # handle torch tensor / numpy array and ensure float32
+            if hasattr(embed_vec, "detach"):  # likely a torch tensor
+                embed_vec = embed_vec.detach().cpu().numpy()
+            embed_vec = np.asarray(embed_vec, dtype=np.float32)
+
             records.append({
-                "x": x,
-                "y": y,
+                "x": float(x),
+                "y": float(y),
                 "species": species,
+                "treeid": int(tree_id),
                 "r_tok": int(tr),
                 "c_tok": int(tc),
-                "pca_vec": pca_vals.astype(np.float32),
+                "pca_vec": pca_vals,
                 "embed_vec": embed_vec,
             })
+    # save as npz
+    if out_path is not None and len(records) > 0:
+        out_path = Path(out_path)
+
+        xs = np.array([r["x"] for r in records], dtype=np.float64)
+        ys = np.array([r["y"] for r in records], dtype=np.float64)
+        species_arr = np.array([r["species"] for r in records], dtype=object)
+        treeid_arr = np.array([r["treeid"] for r in records], dtype=np.int32)
+        r_tok_arr = np.array([r["r_tok"] for r in records], dtype=np.int32)
+        c_tok_arr = np.array([r["c_tok"] for r in records], dtype=np.int32)
+        pca_mat = np.stack([r["pca_vec"] for r in records]).astype(np.float32, copy=False)
+        embed_mat = np.stack([r["embed_vec"] for r in records]).astype(np.float32, copy=False)
+
+        np.savez_compressed(
+            out_path,
+            x=xs,
+            y=ys,
+            species=species_arr,
+            treeid=treeid_arr,
+            r_tok=r_tok_arr,
+            c_tok=c_tok_arr,
+            pca=pca_mat,
+            embed=embed_mat,
+        )
+        print(f"Saved to {out_path}")
+
     return records
 
+def calc_similarity_scores(results, 
+                           n=None, 
+                           verbose=False):
+
+    if n != None:
+        subset = results[:n]
+    else:
+        subset = results
+
+    # Extract species and embeddings
+    species = [rec["species"] for rec in subset]
+    treeids = [rec["treeid"] for rec in subset] 
+    embeddings = np.stack([rec["embed_vec"] for rec in subset])   
+
+    sim_matrix = cosine_similarity(embeddings)   # (5 × 5) matrix
+    dist_matrix = 1 - sim_matrix
+    species_counts = {sp: species.count(sp) for sp in set(species)}
+    print("Species count:", species_counts)
+    print("Embeddings shape:", embeddings.shape) # shape (n_species, 768)
+    
+    if verbose:
+        print("\nCosine similarity matrix:")
+        print(sim_matrix)
+        print("\nCosine distance matrix:")
+        print(dist_matrix)
+        print("\nPairwise cosine distances:")
+        for i in range(len(subset)):
+            for j in range(i+1, len(subset)):
+                print(f"Tree {i} ({species[i]}) ↔ Tree {j} ({species[j]}): "
+                      f"{dist_matrix[i, j]:.4f}")
+                
+    return sim_matrix, dist_matrix, species, treeids
+
+
+def plot_cosine_distance_heatmap(dist_matrix, 
+                                 species, 
+                                 treeids,
+                                 title="Cosine distance heatmap"):
+    """
+    Plot a heatmap of cosine distances between trees.
+
+    Parameters
+    ----------
+    dist_matrix : np.ndarray
+        Square matrix (N x N) of cosine distances (0 = identical, ~1 = orthogonal).
+    species : list or array-like of str
+        Species labels for each tree, length N.
+    title : str, optional
+        Title for the plot.
+    """
+    dist_matrix = np.asarray(dist_matrix)
+    n = dist_matrix.shape[0]
+
+    if dist_matrix.shape[0] != dist_matrix.shape[1]:
+        raise ValueError("dist_matrix must be square (N x N).")
+    if len(species) != n:
+        raise ValueError("len(species) must match dist_matrix size.")
+    if len(treeids) != n:
+        raise ValueError("len(treeids) must match dist_matrix size.")
+
+    # Labels like "123: SpeciesA"
+    labels = [f"{treeid}: {sp}" for treeid, sp in zip(treeids, species)]
+
+    plt.figure(figsize=(13, 12))
+    im = plt.imshow(dist_matrix, interpolation="nearest")
+
+    plt.title(title)
+    plt.xlabel("treeid / species")
+    plt.ylabel("treeid / species")
+
+    plt.xticks(ticks=np.arange(n), labels=labels, rotation=90)
+    plt.yticks(ticks=np.arange(n), labels=labels)
+
+    plt.colorbar(im, label="Cosine distance (1 - similarity)")
+    plt.tight_layout()
+    plt.show()
