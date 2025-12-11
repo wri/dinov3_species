@@ -7,20 +7,31 @@ from rasterio.transform import Affine
 from PIL import Image
 import torch
 import torchvision.transforms.functional as TF
-from dinov3.hub.backbones import dinov3_vitb16 #dinov3_vitl16  # or dinov3_vitb16 
+from dinov3.hub.backbones import dinov3_vitb16, dinov3_vitl16  
 from sklearn.decomposition import PCA
 import time
 
 SPATIAL_WIN  = 768                     # a tile of the image - same as img_size (in px) (was 1536)
 READ_MASKED  = False                   # set True to honor nodata
 PATCH_SIZE   = 16                      # size of image patches used by DINO (in px)
-IMAGE_SIZE   = 768                     # size of each input window fed to model (in px) (was 1536)
-MEAN = (0.430, 0.411, 0.296)
-STD  = (0.213, 0.156, 0.143)
-N_LAYERS = 12                          # number of intermediate layers to request; we use the last one (24 for vit-L/16)
+IMAGE_SIZE   = 768                     # size of each input window fed to model (in px) (was 1536) 
 N_PC     = 3                           # write first 3 PCs
 TARGET_SAMPLE = 10_000                 # the number of tokens to sample across all windows (sample size for PCA fit)
 RNG = np.random.default_rng(0)         # 0 is a seed to ensure PCA gets same sample subset
+
+### vitb16 ###  
+MEAN = (0.485, 0.456, 0.406)           # imagenet, use for dinov3_vitb16
+STD = (0.229, 0.224, 0.225)            # imagenet, use for dinov3_vitb16
+REPO_DIR = "../dinov3"              
+BACKBONE = "vitb16"
+URL = "dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"
+
+### vitl16 ###
+# MEAN = (0.430, 0.411, 0.296)           # satellite, use for dinov3_vitl16 
+# STD  = (0.213, 0.156, 0.143)           # satellite, use for dinov3_vitl16
+# REPO_DIR = "../dinov3"                
+# BACKBONE = "vitl16"
+# URL = "dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth"
 
 
 def resize_transform(mask_image: Image.Image,
@@ -82,6 +93,60 @@ def window_to_tensor(src, win: Window) -> torch.Tensor:
     t = TF.normalize(t, mean=MEAN, std=STD)
     return t  # CHW
 
+def load_dinov3_backbone(backbone: str,
+                         weights_path: str,
+                         device: str = "cpu"
+                         ):
+    
+    '''
+    Initialize model with the provided backbone
+    Loads the model weights
+    identify structure of sub dicts to properly unwrap the 
+    checkpoint and select the right keys to map to the model
+    '''
+
+    if backbone == "vitb16":
+        model = dinov3_vitb16(pretrained=False)
+    elif backbone == "vitl16":
+        model = dinov3_vitl16(pretrained=False)
+
+    ckpt = torch.load(weights_path, map_location=device)
+
+    # Pick the right sub-dict if wrapped
+    if isinstance(ckpt, dict):
+        if "state_dict" in ckpt:
+            state = ckpt["state_dict"]
+        elif "model" in ckpt:
+            state = ckpt["model"]
+        elif "teacher" in ckpt:
+            state = ckpt["teacher"]
+        else:
+            state = ckpt
+    else:
+        state = ckpt
+
+    # Strip 'module.' prefix from DDP checkpoint
+    # this doesn't really apply - no module prefix in dict
+    clean_state = {}
+    for k, v in state.items():
+        if k.startswith("module."):
+            k = k[len("module."):]
+        clean_state[k] = v
+
+    # 5) Load with diagnostics
+    missing, unexpected = model.load_state_dict(clean_state, strict=False)
+    print(f"Missing keys: {len(missing)}")
+    print(f"Unexpected keys: {len(unexpected)}")
+
+    # if missing is high - might be the wrong checkpt/weights for the backbone
+    if missing:
+        print("  e.g. missing:", missing[:5])
+    if unexpected:
+        print("  e.g. unexpected:", unexpected[:5])
+
+    model.eval()
+    return model
+
 def extract_embeddings(model, x):
     """
     Returns
@@ -100,7 +165,8 @@ def extract_embeddings(model, x):
             x, n=[len(model.blocks) - 1], reshape=True, norm=True
             )[-1].squeeze(0)                   # (Ht, Wt, C)
     
-    # if channels come first in returned feat map, switch them (channels will always be biggest val)
+    # if channels come first in returned feat map, switch them 
+    # (channels will always be biggest val)
     if feat.shape[0] > feat.shape[1] and feat.shape[0] > feat.shape[2]:
         feat = feat.permute(1, 2, 0).contiguous()
 
@@ -111,11 +177,11 @@ def extract_embeddings(model, x):
                   .detach().cpu().numpy()
                   .astype(np.float32, copy=False))
 
-    # Hard guard while debugging
+    #  debugging
     assert tokens.ndim == 2 and tokens.shape[1] == Channels, f"tokens bad shape: {tokens.shape}"
     return tokens, Ht, Wt, Channels
 
-def infer_pipe(image_path: str):
+def infer_pipe(image_path: str, out_path: str):
 
     '''
     Loads dinov3 model
@@ -124,7 +190,27 @@ def infer_pipe(image_path: str):
     Applies
     '''
 
-    model = dinov3_vitb16(pretrained=False).eval()
+    # original workflow -- randomly initialized web model (no weights) 
+    #model = dinov3_vitb16(pretrained=False).eval()
+    
+    # attempt 2 -- using John's approach
+    # model = dinov3_vitb16(pretrained=False)
+    # state_dict = torch.load(URL, map_location="cpu")
+    # model.load_state_dict(state_dict, strict=False)
+
+    # attempt 3 - using dinov3 repo documentation
+    # WEIGHTS_PATH = os.path.join(REPO_DIR, "dinov3", "weights", URL)
+
+    # model = torch.hub.load(
+    #     REPO_DIR,
+    #     'dinov3_vitb16',      
+    #     source='local',
+    #     weights=WEIGHTS_PATH,
+    # )
+    # model.eval()
+
+    WEIGHTS_PATH = os.path.join(REPO_DIR, "dinov3", "weights", URL)
+    model = load_dinov3_backbone(BACKBONE, WEIGHTS_PATH)
 
     with rasterio.open(image_path) as src:
         print("=== Source ===")
@@ -218,8 +304,6 @@ def infer_pipe(image_path: str):
             blockysize=512,
             BIGTIFF="YES",
         )
-
-        out_path = os.path.splitext(image_path)[0] + "_pca.tif"
         with rasterio.open(out_path, "w", **profile) as dst:
             # optional: initialize bands with zeros
             for b in range(1, N_PC + 1):
