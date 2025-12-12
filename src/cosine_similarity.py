@@ -20,8 +20,12 @@ import matplotlib.pyplot as plt
 
 IMAGE_SIZE = 768
 PATCH_SIZE = 16
-MEAN = (0.430, 0.411, 0.296)
-STD  = (0.213, 0.156, 0.143)
+# MEAN = (0.430, 0.411, 0.296)
+# STD  = (0.213, 0.156, 0.143)
+MEAN = (0.485, 0.456, 0.406) # imagenet
+STD = (0.229, 0.224, 0.225)  # imagenet
+URL = "../dinov3/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"
+
 
 def build_tree_aoi(image_path: str,
                    trees_path: str,
@@ -205,6 +209,9 @@ def per_tree_features(image_path: str,
     Return table with lat, lon, species, token_row, token_col, pca_vec, embed_vec
     '''
     model = dinov3_vitb16(pretrained=False).eval()
+    state_dict = torch.load(URL, map_location="cpu")
+    model.load_state_dict(state_dict, strict=False)
+
     trees = gpd.read_file(trees_path)
     records: list[dict] = []
 
@@ -258,15 +265,16 @@ def per_tree_features(image_path: str,
 
             win = Window(c0, r0, c1 - c0, r1 - r0)
 
-            x_tensor = window_to_tensor(src_img, win).unsqueeze(0)
+            x_tensor = window_to_tensor(src_img, win).unsqueeze(0) # (1, 3 RGB,H*,W*)
 
-            tokens, Ht, Wt, Channels = extract_embeddings(model, x_tensor)
+            tokens, Ht, Wt, Channels = extract_embeddings(model, x_tensor) 
 
             # Map tree location to token index (tr, tc)
             r_off = row_img - r0
             c_off = col_img - c0
 
             # convert to model input coords (scaled to IMAGE_SIZE)
+            # Fix scale_c
             scale_r = IMAGE_SIZE / (r1 - r0)
             scale_c = IMAGE_SIZE / (c1 - c0)
 
