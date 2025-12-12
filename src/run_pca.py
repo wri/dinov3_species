@@ -17,7 +17,7 @@ READ_MASKED  = False                   # set True to honor nodata
 PATCH_SIZE   = 16                      # size of image patches used by DINO (in px)
 IMAGE_SIZE   = 768                     # size of each input window fed to model (in px) (was 1536) 
 N_PC     = 3                           # write first 3 PCs
-TARGET_SAMPLE = 10_000                 # the number of tokens to sample across all windows (sample size for PCA fit)
+TARGET_SAMPLE = 20_000                 # the number of tokens to sample across all windows (sample size for PCA fit)
 RNG = np.random.default_rng(0)         # 0 is a seed to ensure PCA gets same sample subset
 
 ### vitb16 ###  
@@ -53,7 +53,6 @@ def build_windows(src, spatial_win=SPATIAL_WIN):
     return wins
 
 def resize_transform(mask_image: Image.Image,
-                     image_size: int = IMAGE_SIZE,
                      patch_size: int = PATCH_SIZE) -> torch.Tensor:
     """
     Objective: Convert a PIL RGB window into a CHW float tensor in [0, 1] with
@@ -64,18 +63,19 @@ def resize_transform(mask_image: Image.Image,
     Array has shape (H, W, 3), dtype uint8, range [0, 255].
 
     Output (torch.Tensor): non-normalized input to Dinov3 backbone. Array has shape
-    (3, H, W), dtype torch.float32, range [0.0, 1.0] per channel.
+    (3, out_h, out_w), dtype torch.float32, range [0.0, 1.0] per channel.
     """
     w, h = mask_image.size
-    h_patches = int(image_size / patch_size)               # e.g., 96
-    w_patches = int((w * image_size) / (h * patch_size))   # preserves aspect ratio
-    out_h = h_patches * patch_size
-    out_w = w_patches * patch_size
-    # print(f"Mask img size: {w,h}")
-    # print(f"h_patches, w_patches: {h_patches, w_patches}")
-    # print(f"out_h, out_w: {out_h, out_w}")
-    out_arr = TF.to_tensor(TF.resize(mask_image, (out_h, out_w)))
-    return out_arr
+    out_h = (h // patch_size) * patch_size
+    out_w = (w // patch_size) * patch_size
+
+    print(f"Mask img size (W,H): ({w}, {h})")
+    print(f"Cropped size (W*,H*): ({out_w}, {out_h})")
+
+    # Center-crop (or top-left crop) to avoid resampling
+    # Here: top-left crop for simplicity
+    mask_image = mask_image.crop((0, 0, out_w, out_h))
+    return TF.to_tensor(mask_image)
 
 def window_to_tensor(src, win: Window, debug) -> torch.Tensor:
     """
@@ -117,6 +117,7 @@ def window_to_tensor(src, win: Window, debug) -> torch.Tensor:
     if debug:
         print(f"---DEBUG---")
         print(f"confirm dtype is uint8: {u8.dtype}")
+        print(f"confirm shape is HWC: {u8.shape}")
         print(f"confirm dtype is float32: {t.dtype}")
         print(f"confirm shape is CHW: {t.shape}")
         print(f"confirm range is 0,1: {t.min(), t.max()}")
@@ -191,40 +192,14 @@ def extract_embeddings(model, x):
     n = [len(model.blocks) - 1]   # n = 11
     """
     with torch.inference_mode():
-        feat = model.get_intermediate_layers(x, n=[len(model.blocks) - 1], reshape=True, norm=True) # (B, C, Ht, Wt)
-        feat = feat[-1].squeeze(0) # (C, Ht, Wt)
+        feat = model.get_intermediate_layers(x, n=[len(model.blocks) - 1], reshape=True, norm=True)[-1] # (B, C, Ht, Wt)
+        feat = feat.squeeze(0) # (C, Ht, Wt) [768, 48, 48])
     return feat
 
 def infer_pipe(image_path: str, 
                out_path: str,
                #debug: bool
                ):
-
-    '''
-    Loads dinov3 model
-    Builds windows
-    Samples entire image to fit PCA
-    Applies
-    '''
-
-    # original workflow -- randomly initialized web model (no weights) 
-    #model = dinov3_vitb16(pretrained=False).eval()
-    
-    # attempt 2 -- using John's approach
-    # model = dinov3_vitb16(pretrained=False)
-    # state_dict = torch.load(URL, map_location="cpu")
-    # model.load_state_dict(state_dict, strict=False)
-
-    # attempt 3 - using dinov3 repo documentation
-    # WEIGHTS_PATH = os.path.join(REPO_DIR, "dinov3", "weights", URL)
-
-    # model = torch.hub.load(
-    #     REPO_DIR,
-    #     'dinov3_vitb16',      
-    #     source='local',
-    #     weights=WEIGHTS_PATH,
-    # )
-    # model.eval()
 
     WEIGHTS_PATH = os.path.join(REPO_DIR, "dinov3", "weights", URL)
     model = load_dinov3_backbone(BACKBONE, WEIGHTS_PATH)
@@ -253,14 +228,23 @@ def infer_pipe(image_path: str,
 
         for i, win in enumerate(windows, 1):
 
-            # --- skip windows with all 0.0 values ---
+            # dont sample windows with >50% 0 values
             arr = src.read([1, 2, 3], window=win)
-            if not np.any(arr):
+            empty_mask = np.all(arr == 0, axis=0) 
+            empty_frac = empty_mask.mean()
+            if empty_frac > 0.5:
                 continue
 
-            x = window_to_tensor(src, win, debug=False).unsqueeze(0)  # (1,3,H*,W*)
-            feat = extract_embeddings(model, x)  # (C, Ht, Wt)
+            x = window_to_tensor(src, win, debug=True).unsqueeze(0)  # (1,3,H*,W*)
+            print("x shape:", x.shape)
+            feat = extract_embeddings(model, x)  # (C, Ht, Wt) 
+            print("feat shape:", feat.shape) # this is showing [768, 48, 48])
             C, Ht, Wt = feat.shape
+
+            # assert
+            Ht_expected = x.shape[-2] // PATCH_SIZE
+            Wt_expected = x.shape[-1] // PATCH_SIZE
+            assert (Ht, Wt) == (Ht_expected, Wt_expected), (Ht, Wt, Ht_expected, Wt_expected)
             
             # compute tokens for PCA
             tokens = (feat.permute(1, 2, 0)              # (Ht, Wt, C)
@@ -305,8 +289,8 @@ def infer_pipe(image_path: str,
         # Prepare output GeoTIFF 
         # -------------------------------------------------------
         H, W = src.height, src.width
-        out_h = math.ceil(H / PATCH_SIZE)
-        out_w = math.ceil(W / PATCH_SIZE)
+        out_h = H // PATCH_SIZE
+        out_w = W // PATCH_SIZE     
 
         # increase pixel size by patch size
         out_transform = src.transform * Affine.scale(PATCH_SIZE, PATCH_SIZE)
@@ -343,6 +327,8 @@ def infer_pipe(image_path: str,
                 # compute location in token grid
                 y0_tok = win.row_off // PATCH_SIZE
                 x0_tok = win.col_off // PATCH_SIZE
+                assert win.row_off % PATCH_SIZE == 0 and win.col_off % PATCH_SIZE == 0, (win.row_off, win.col_off)
+
 
                 # get features for the current window
                 x = window_to_tensor(src, win, debug=False).unsqueeze(0)   # (1, 3, H*, W*)
@@ -354,15 +340,28 @@ def infer_pipe(image_path: str,
                         .detach().cpu().numpy()
                         .astype(np.float32, copy=False)
                 )
+                # assert
+                Ht_expected = x.shape[-2] // PATCH_SIZE
+                Wt_expected = x.shape[-1] // PATCH_SIZE
+                assert (Ht, Wt) == (Ht_expected, Wt_expected), (Ht, Wt, Ht_expected, Wt_expected)
 
                 # Apply PCAs to compress embeddings
                 pcs = pca.transform(tokens)                         # (N_tokens, N_PC)
                 pcs = pcs.astype(np.float32).reshape(Ht, Wt, N_PC)  # (Ht, Wt, N_PC)
 
-                # multiply by 2 and pass through sigmoid to convert [0,1] → [0,255] 
-                pcs_t = torch.from_numpy(pcs)                                         # H, W, 3
-                vis = torch.sigmoid(pcs_t.mul(2.0)).permute(2, 0, 1)                  # 3, H, W 
-                vis_u8 = (vis.clamp(0, 1) * 255.0).round().to(torch.uint8).numpy()
+                # # multiply by 2 and pass through sigmoid to convert [0,1] → [0,255] 
+                # pcs_t = torch.from_numpy(pcs)                                         # H, W, 3
+                # vis = torch.sigmoid(pcs_t.mul(2.0)).permute(2, 0, 1)                  # 3, H, W 
+                # vis_u8 = (vis.clamp(0, 1) * 255.0).round().to(torch.uint8).numpy()
+                
+                # another way of visualizing to confirm sigmoid isnt creating checkers
+                pcs_vis = np.empty_like(pcs, dtype=np.float32)
+                for k in range(N_PC):
+                    pc = pcs[..., k]
+                    lo, hi = pc.min(), pc.max()
+                    pcs_vis[..., k] = 0.0 if hi <= lo else (pc - lo) / (hi - lo)
+
+                vis_u8 = (pcs_vis.transpose(2, 0, 1) * 255).round().astype(np.uint8)
 
                 # clip to raster edges on token grid (border windows)
                 y1_tok = min(y0_tok + Ht, out_h)
@@ -373,6 +372,9 @@ def infer_pipe(image_path: str,
                     continue
 
                 win_tok = Window(x0_tok, y0_tok, w_write, h_write)
+                print("--DEBUG WIN--")
+                print(win, float(pcs.mean()), float(pcs.std()))
+                print(win_tok)
                 for b in range(N_PC):
                     dst.write(vis_u8[b, :h_write, :w_write], b + 1, window=win_tok)
 
