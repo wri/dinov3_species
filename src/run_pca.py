@@ -1,133 +1,150 @@
-#!/usr/bin/env python3
 import os
-import time
-from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple, Optional
-
+import math
 import numpy as np
 import rasterio
 from rasterio.windows import Window
 from rasterio.transform import Affine
 from PIL import Image
-
 import torch
 import torchvision.transforms.functional as TF
+from dinov3.hub.backbones import dinov3_vitb16, dinov3_vitl16  
 from sklearn.decomposition import PCA
-import torch.nn.functional as F
+import time
+import matplotlib.pyplot as plt
 
-from dinov3.hub.backbones import dinov3_vitb16, dinov3_vitl16
+SPATIAL_WIN  = 768                     # a tile of the image - same as img_size (in px) (was 1536)
+READ_MASKED  = False                   # set True to honor nodata
+PATCH_SIZE   = 16                      # size of image patches used by DINO (in px)
+IMAGE_SIZE   = 768                     # size of each input window fed to model (in px) (was 1536) 
+N_PC     = 3                           # write first 3 PCs
+TARGET_SAMPLE = 20_000                 # the number of tokens to sample across all windows (sample size for PCA fit)
+RNG = np.random.default_rng(0)         # 0 is a seed to ensure PCA gets same sample subset
 
-
-WINDOW_PX   = 768          # tile size (px)
-STRIDE_PX   = 256          # overlap stride (px)
-PATCH_SIZE  = 16
-N_PC        = 3
-TARGET_SAMPLE = 20_000
-
-READ_MASKED = False
-EMPTY_FRAC_THRESH = 0.5
-
-# --- vitb16 ---
-MEAN = (0.485, 0.456, 0.406)
-STD  = (0.229, 0.224, 0.225)
-REPO_DIR = "../dinov3"
+### vitb16 ###  
+MEAN = (0.485, 0.456, 0.406)           # imagenet, use for dinov3_vitb16
+STD = (0.229, 0.224, 0.225)            # imagenet, use for dinov3_vitb16
+REPO_DIR = "../dinov3"              
 BACKBONE = "vitb16"
 URL = "dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"
 
-# --- vitl16 ---
-# MEAN = (0.430, 0.411, 0.296)
-# STD  = (0.213, 0.156, 0.143)
-# REPO_DIR = "../dinov3"
+### vitl16 ###
+# MEAN = (0.430, 0.411, 0.296)           # satellite, use for dinov3_vitl16 
+# STD  = (0.213, 0.156, 0.143)           # satellite, use for dinov3_vitl16
+# REPO_DIR = "../dinov3"                
 # BACKBONE = "vitl16"
 # URL = "dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth"
 
-DEVICE = "mps"
 
-# ===================== HELPERS =====================
-def _axis_starts(full_len: int, win: int, stride: int) -> List[int]:
+def build_windows(src, spatial_win=SPATIAL_WIN):
     """
-    Start positions ensuring end coverage.
-    If full_len <= win: [0]
-    Else: regular stride starts + a final start at (full_len - win) if needed.
+    Build non-overlapping windows that tile the raster 
+    (edge windows are clipped).
     """
-    if full_len <= win:
-        return [0]
-    starts = list(range(0, full_len - win + 1, stride))
-    last = full_len - win
-    if starts[-1] != last:
-        starts.append(last)
-    return starts
-
-def build_overlapping_windows_with_edges(src, win_px: int, stride_px: int) -> List[Window]:
     h, w = src.height, src.width
-    ys = _axis_starts(h, win_px, stride_px)
-    xs = _axis_starts(w, win_px, stride_px)
+    rows = range(0, h, spatial_win)
+    cols = range(0, w, spatial_win)
     wins = []
-    for y in ys:
-        for x in xs:
-            win_h = min(win_px, h - y)
-            win_w = min(win_px, w - x)
+    for y in rows:
+        for x in cols:
+            win_h = min(spatial_win, h - y)
+            win_w = min(spatial_win, w - x)
             if win_h > 0 and win_w > 0:
                 wins.append(Window(x, y, win_w, win_h))
     return wins
 
-def resize_transform(pil: Image.Image, patch_size: int = PATCH_SIZE) -> torch.Tensor:
+def resize_transform(mask_image: Image.Image,
+                     patch_size: int = PATCH_SIZE) -> torch.Tensor:
     """
-    Top-left crop to multiples of patch_size with no resampling
+    Objective: Convert a PIL RGB window into a CHW float tensor in [0, 1] with
+    height/width constrained to multiples of the ViT patch size.
+    CONFIRM constraint
+
+    Input (mask_image): PIL.Image.Image. Input image for a single window. 
+    Array has shape (H, W, 3), dtype uint8, range [0, 255].
+
+    Output (torch.Tensor): non-normalized input to Dinov3 backbone. Array has shape
+    (3, out_h, out_w), dtype torch.float32, range [0.0, 1.0] per channel.
     """
-    w, h = pil.size
+    w, h = mask_image.size
     out_h = (h // patch_size) * patch_size
     out_w = (w // patch_size) * patch_size
-    if out_h <= 0 or out_w <= 0:
-        raise ValueError(f"Window too small after patch crop: in=({w},{h}) out=({out_w},{out_h})")
-    pil = pil.crop((0, 0, out_w, out_h))
-    return TF.to_tensor(pil)  # CHW float32 [0,1]
 
-def window_is_empty(src, win: Window, empty_frac_thresh: float = EMPTY_FRAC_THRESH) -> bool:
-    arr = src.read([1, 2, 3], window=win, masked=READ_MASKED)
+    print(f"Mask img size (W,H): ({w}, {h})")
+    print(f"Cropped size (W*,H*): ({out_w}, {out_h})")
+
+    # Center-crop (or top-left crop) to avoid resampling
+    # Here: top-left crop for simplicity
+    mask_image = mask_image.crop((0, 0, out_w, out_h))
+    return TF.to_tensor(mask_image)
+
+def window_to_tensor(src, win: Window, debug) -> torch.Tensor:
+    """
+    Objective: Read 3-band raster window and convert to normalized CHW tensor
+    suitable as Dinov3 input.
+
+    Input (src): 3-band RGB raster with shape (H, W),
+    dype uint8, uint16, float32, etc. 
+    win becomes (3, H, W)
+
+    Output (torch.Tensor): normalized input to Dinov3 backbone. Array has shape 
+    (3, out_h, out_w) where out_h/out_w are multiples of `PATCH_SIZE` and 
+    aspect-ratio preserving for the window. dtype torch.float32. range standardized
+    using MEAN/STD config.
+
+    """
+    if src.count < 3:
+        raise ValueError(f"Expected >=3 bands, found {src.count}")
+
+    arr = src.read([1,2,3], window=win, masked=READ_MASKED)  # (3, H, W)
     if isinstance(arr, np.ma.MaskedArray):
         arr = arr.filled(0)
-    # empty if all three bands are 0 at a pixel
-    empty_mask = np.all(arr == 0, axis=0)
-    empty_frac = float(empty_mask.mean())
-    return empty_frac > empty_frac_thresh
-
-def window_to_tensor(src, win: Window) -> torch.Tensor:
-    """
-    Read window -> PIL -> crop to patch multiple -> normalize
-    Returns (3, H*, W*) where H*,W* are multiples of PATCH_SIZE
-    """
-    arr = src.read([1, 2, 3], window=win, masked=READ_MASKED)  # (3,H,W)
-    if isinstance(arr, np.ma.MaskedArray):
-        arr = arr.filled(0)
-    hwc = np.transpose(arr, (1, 2, 0))  # (H,W,3)
+    hwc = np.transpose(arr, (1,2,0))
 
     # map dtype to uint8 for PIL
     if hwc.dtype == np.uint8:
         u8 = hwc
     elif hwc.dtype == np.uint16:
-        u8 = (hwc / 65535.0 * 255.0).round().clip(0, 255).astype(np.uint8)
+        u8 = (hwc / 65535.0 * 255.0).round().clip(0,255).astype(np.uint8)
     elif np.issubdtype(hwc.dtype, np.floating):
         u8 = np.clip(hwc * 255.0, 0, 255).astype(np.uint8)
     else:
-        raise TypeError(f"Unexpected raster dtype '{hwc.dtype}'")
+        raise TypeError(f"Unexpected raster dtype '{hwc.dtype}'. ")
 
-    pil = Image.fromarray(u8)
-    t = resize_transform(pil, patch_size=PATCH_SIZE)
+    pil = Image.fromarray(u8)            # RGB
+    t = resize_transform(pil)            # CHW float32 [0,1]
     t_norm = TF.normalize(t, mean=MEAN, std=STD)
-    return t_norm
 
-def load_dinov3_backbone(backbone: str, weights_path: str, device: str = "cpu"):
+    if debug:
+        print(f"---DEBUG---")
+        print(f"confirm dtype is uint8: {u8.dtype}")
+        print(f"confirm shape is HWC: {u8.shape}")
+        print(f"confirm dtype is float32: {t.dtype}")
+        print(f"confirm shape is CHW: {t.shape}")
+        print(f"confirm range is 0,1: {t.min(), t.max()}")
+        print(f"confirm post norm: {t_norm.min(), t_norm.max()}")
+
+    return t_norm  # CHW
+
+def load_dinov3_backbone(backbone: str,
+                         weights_path: str,
+                         device: str = "cpu"
+                         ):
+    
+    '''
+    Initialize model with the provided backbone
+    Loads the model weights
+    identify structure of sub dicts to properly unwrap the 
+    checkpoint and select the right keys to map to the model
+    '''
+
     if backbone == "vitb16":
         model = dinov3_vitb16(pretrained=False)
     elif backbone == "vitl16":
         model = dinov3_vitl16(pretrained=False)
-    else:
-        raise ValueError(f"Unknown backbone '{backbone}'")
 
     ckpt = torch.load(weights_path, map_location=device)
 
-    # unwrap common checkpoint formats
+    # Pick the right sub-dict if wrapped
     if isinstance(ckpt, dict):
         if "state_dict" in ckpt:
             state = ckpt["state_dict"]
@@ -140,12 +157,20 @@ def load_dinov3_backbone(backbone: str, weights_path: str, device: str = "cpu"):
     else:
         state = ckpt
 
+    # Strip 'module.' prefix from DDP checkpoint
+    # this doesn't really apply - no module prefix in dict
     clean_state = {}
     for k, v in state.items():
-        clean_state[k[len("module."):] if k.startswith("module.") else k] = v
+        if k.startswith("module."):
+            k = k[len("module."):]
+        clean_state[k] = v
 
+    # 5) Load with diagnostics
     missing, unexpected = model.load_state_dict(clean_state, strict=False)
-    print(f"Missing keys: {len(missing)} | Unexpected keys: {len(unexpected)}")
+    print(f"Missing keys: {len(missing)}")
+    print(f"Unexpected keys: {len(unexpected)}")
+
+    # if missing is high - might be the wrong checkpt/weights for the backbone
     if missing:
         print("  e.g. missing:", missing[:5])
     if unexpected:
@@ -154,263 +179,129 @@ def load_dinov3_backbone(backbone: str, weights_path: str, device: str = "cpu"):
     model.eval()
     return model
 
-def extract_embeddings(model, x_bchw: torch.Tensor) -> torch.Tensor:
+def extract_embeddings(model, x):
     """
-    Returns (C, Ht, Wt)
+    Extract spatial DINOv3 embeddings for a single image window.
+    Returns a pytorch tensor.
+    
+    ** NOTE: switching models can change the axis order of the 
+    returned feature map. confirm that 
+    get_intermediate_layers(..., reshape=True, ...) still returns 
+    (B, C, Ht, Wt) **
+
+    n = [len(model.blocks) - 1]   # n = 11
     """
     with torch.inference_mode():
-        feat = model.get_intermediate_layers(
-            x_bchw, n=[len(model.blocks) - 1], reshape=True, norm=True
-        )[-1]  # (B,C,Ht,Wt)
-        return feat.squeeze(0)
+        feat = model.get_intermediate_layers(x, n=[len(model.blocks) - 1], reshape=True, norm=True)[-1] # (B, C, Ht, Wt)
+        feat = feat.squeeze(0) # (C, Ht, Wt) [768, 48, 48])
+    return feat
 
-def flatten_tokens(feat_chw: torch.Tensor) -> np.ndarray:
-    """
-    (C,Ht,Wt) -> (Ht*Wt, C) float32
-    """
-    C, Ht, Wt = feat_chw.shape
-    return (
-        feat_chw.permute(1, 2, 0)
-        .reshape(Ht * Wt, C)
-        .detach().cpu().numpy()
-        .astype(np.float32, copy=False)
-    )
+def infer_pipe(image_path: str, 
+               out_path: str,
+               #debug: bool
+               ):
 
-_hann_cache: Dict[Tuple[int, int], np.ndarray] = {}
-def hann2d(h: int, w: int) -> np.ndarray:
-    """
-    2D Hann weights for blending. Cached by shape.
-    """
-    key = (h, w)
-    if key in _hann_cache:
-        return _hann_cache[key]
-    wy = np.hanning(h) if h > 1 else np.ones((h,), dtype=np.float32)
-    wx = np.hanning(w) if w > 1 else np.ones((w,), dtype=np.float32)
-    ww = np.outer(wy, wx).astype(np.float32)
-    # avoid all-zeros at tiny sizes
-    if np.max(ww) <= 0:
-        ww = np.ones((h, w), dtype=np.float32)
-    _hann_cache[key] = ww
-    return ww
-
-def robust_lo_hi(x: np.ndarray, lo_p=2.0, hi_p=98.0) -> Tuple[float, float]:
-    lo = float(np.percentile(x, lo_p))
-    hi = float(np.percentile(x, hi_p))
-    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-        lo, hi = float(np.min(x)), float(np.max(x))
-        if hi <= lo:
-            hi = lo + 1e-6
-    return lo, hi
-
-def infer_overlap_blend_possub(
-    image_path: str,
-    out_path: str,
-    pos_template_max_windows: int = 200,     # how many full windows to estimate positional template
-    pca_sample_per_window: int = 256,        # how many tokens to sample per window for PCA fit
-    pca_max_windows: int = 5000,             # safety cap
-    scale_lo_pct: float = 2.0,
-    scale_hi_pct: float = 98.0,
-):
-    weights_path = os.path.join(REPO_DIR, "dinov3", "weights", URL)
-    model = load_dinov3_backbone(BACKBONE, weights_path, device=DEVICE)
-
-    rng = np.random.default_rng(0)
+    WEIGHTS_PATH = os.path.join(REPO_DIR, "dinov3", "weights", URL)
+    model = load_dinov3_backbone(BACKBONE, WEIGHTS_PATH)
 
     with rasterio.open(image_path) as src:
-        print("=== Source image ===")
-        print("H,W:", src.height, src.width, "| bands:", src.count, "| res:", src.res)
-        print("transform:", src.transform)
+        print("=== Source image deets ===")
+        print("Size (H, W):", src.height, src.width)
+        print("CRS:", src.crs)
+        print("Transform:", src.transform)
+        print("Resolution:", src.res)
+        print("Bands:", src.count)
         print()
 
-        windows = build_overlapping_windows_with_edges(src, WINDOW_PX, STRIDE_PX)
-        print(f"Built {len(windows)} overlapping windows (with edge coverage): win={WINDOW_PX} stride={STRIDE_PX}")
+        # Build windows
+        windows = build_windows(src, spatial_win=SPATIAL_WIN)
+        print(f"Built {len(windows)} non-overlapping windows (size={SPATIAL_WIN}px)")
 
-        # Global token grid size (floor to full patches)
-        out_h = src.height // PATCH_SIZE
-        out_w = src.width // PATCH_SIZE
-        if out_h <= 0 or out_w <= 0:
-            raise RuntimeError("Image too small for even one patch.")
+        # -------------------------------
+        # PASS 1: Sample tokens → fit PCA
+        # -------------------------------
+        # divide target sample evenly across all windows but always take >=1 sample per window
+        tokens_per_window = max(1, TARGET_SAMPLE // max(1, len(windows))) 
+        sample_buf = []
 
-        # -------------------------------------------------------
-        # PASS 0: positional template (full windows only)
-        # -------------------------------------------------------
-        Ht_full = (WINDOW_PX // PATCH_SIZE)
-        Wt_full = (WINDOW_PX // PATCH_SIZE)
-        pos_sum: Optional[torch.Tensor] = None
-        pos_n = 0
+        start_batch_time = time.time()
 
-        t0 = time.time()
         for i, win in enumerate(windows, 1):
-            # only use full windows for a stable template
-            if int(win.height) != WINDOW_PX or int(win.width) != WINDOW_PX:
-                continue
-            if window_is_empty(src, win):
-                continue
 
-            x = window_to_tensor(src, win).unsqueeze(0)   # (1,3,H*,W*) == (1,3,768,768)
-            feat = extract_embeddings(model, x)           # (C,48,48) for 768/16
-            C, Ht, Wt = feat.shape
-            if (Ht, Wt) != (Ht_full, Wt_full):
+            # dont sample windows with >50% 0 values
+            arr = src.read([1, 2, 3], window=win)
+            empty_mask = np.all(arr == 0, axis=0) 
+            empty_frac = empty_mask.mean()
+            if empty_frac > 0.5:
                 continue
 
-            if pos_sum is None:
-                pos_sum = torch.zeros_like(feat)
-            pos_sum += feat
-            pos_n += 1
-
-            if pos_n >= pos_template_max_windows:
-                break
-
-            if i % 50 == 0:
-                print(f"Pos-template: scanned {i}/{len(windows)} windows; collected {pos_n}")
-
-        if pos_sum is None or pos_n == 0:
-            pos_template = None
-            print("Pos-template: not built (no valid full non-empty windows).")
-        else:
-            pos_template = (pos_sum / pos_n).detach()
-            print(f"Pos-template built from {pos_n} full windows in {time.time()-t0:.1f}s. shape={tuple(pos_template.shape)}")
-
-        # -------------------------------------------------------
-        # PASS 1: PCA fit (sample tokens from many windows)
-        # -------------------------------------------------------
-        samples = []
-        sampled = 0
-        kept_windows = 0
-
-        t1 = time.time()
-        for i, win in enumerate(windows, 1):
-            if kept_windows >= pca_max_windows:
-                break
-            if window_is_empty(src, win):
-                continue
-
-            x = window_to_tensor(src, win).unsqueeze(0)
-            feat = extract_embeddings(model, x)  # (C,Ht,Wt)
+            x = window_to_tensor(src, win, debug=True).unsqueeze(0)  # (1,3,H*,W*)
+            print("x shape:", x.shape)
+            feat = extract_embeddings(model, x)  # (C, Ht, Wt) 
+            print("feat shape:", feat.shape) # this is showing [768, 48, 48])
             C, Ht, Wt = feat.shape
 
-            # subtract positional template if available (top-left slice matches our crop behavior)
-            if pos_template is not None:
-                # pos_template is (C,Ht_full,Wt_full); take top-left for edge windows
-                feat = feat - pos_template[:, :Ht, :Wt]
+            # assert
+            Ht_expected = x.shape[-2] // PATCH_SIZE
+            Wt_expected = x.shape[-1] // PATCH_SIZE
+            assert (Ht, Wt) == (Ht_expected, Wt_expected), (Ht, Wt, Ht_expected, Wt_expected)
+            
+            # compute tokens for PCA
+            tokens = (feat.permute(1, 2, 0)              # (Ht, Wt, C)
+                    .reshape(Ht * Wt, C)                 # (N_tokens, C)
+                    .detach().cpu().numpy()
+                    .astype(np.float32, copy=False))
 
-            tokens = flatten_tokens(feat)  # (N,C)
-
-            # remove per-window global component
-            tokens = tokens - tokens.mean(axis=0, keepdims=True)
-
-            take = min(pca_sample_per_window, tokens.shape[0])
+            N_tokens = tokens.shape[0]  # num tokens extracted from this window
+            take = min(N_tokens, tokens_per_window)
             if take > 0:
-                idx = rng.choice(tokens.shape[0], size=take, replace=False)
-                samples.append(tokens[idx])
-                sampled += take
-                kept_windows += 1
+                idx = RNG.choice(N_tokens, size=take, replace=False)
+                sample_buf.append(tokens[idx])           # (take, C)
 
-            if sampled >= TARGET_SAMPLE:
-                break
+            if i % 10 == 0:
+                elapsed = time.time() - start_batch_time
+                avg_per_win = elapsed / 10
+                print(f"Processed {i:04d}/{len(windows)} windows "
+                    f"→ batch took {elapsed:.1f}s (avg {avg_per_win:.2f}s/window)")
+                start_batch_time = time.time()
+        
+        ## DEBUGGING
+        for k, a in enumerate(sample_buf):
+            if a.ndim != 2:
+                raise ValueError(f"sample_buf[{k}] has ndim={a.ndim}, shape={a.shape} (expected 2D (N,C))")
+            if k == 0: #look at the first sample to get the expected embedding dim
+                expected_embedding_dim = a.shape[1]
+            elif a.shape[1] != expected_embedding_dim:
+                raise ValueError(
+                    f"Feature-dim mismatch at sample_buf[{k}]: "
+                    f"cols={a.shape[1]} vs expected {expected_embedding_dim}. "
+                    "An unflattened (Ht,Wt[,C]) array was appended."
+                )
 
-            if i % 50 == 0:
-                print(f"PCA-fit: scanned {i}/{len(windows)} | kept {kept_windows} | sampled {sampled}/{TARGET_SAMPLE}")
+        sample = np.concatenate(sample_buf, axis=0)  # (~TARGET_SAMPLE, C)
+        print(f"Fitting PCA on {sample.shape[0]} tokens...")
 
-        if not samples:
-            raise RuntimeError("No PCA samples collected (everything empty?).")
-
-        sample_mat = np.concatenate(samples, axis=0)
-        print(f"Fitting PCA on {sample_mat.shape[0]} tokens, dim={sample_mat.shape[1]} ...")
         pca = PCA(n_components=N_PC, svd_solver="randomized", whiten=False, random_state=0)
-        pca.fit(sample_mat)
-        print(f"PCA fitted in {time.time()-t1:.1f}s.")
+        pca.fit(sample)
+        print("PCA fitted.")
 
         # -------------------------------------------------------
-        # PASS 2: Overlap + blend into global token grid
+        # Prepare output GeoTIFF 
         # -------------------------------------------------------
-        acc = np.zeros((N_PC, out_h, out_w), dtype=np.float32)
-        wgt = np.zeros((out_h, out_w), dtype=np.float32)
+        H, W = src.height, src.width
+        out_h = H // PATCH_SIZE
+        out_w = W // PATCH_SIZE     
 
-        t2 = time.time()
-        wrote_windows = 0
-
-        for i, win in enumerate(windows, 1):
-            if window_is_empty(src, win):
-                continue
-
-            # Map pixel origin -> token origin
-            y0_tok = int(win.row_off) // PATCH_SIZE
-            x0_tok = int(win.col_off) // PATCH_SIZE
-
-            # Build tensor (cropped to patch multiple) and infer tokens
-            x = window_to_tensor(src, win)
-            H_star, W_star = int(x.shape[-2]), int(x.shape[-1])
-            if H_star <= 0 or W_star <= 0:
-                continue
-
-            Ht = H_star // PATCH_SIZE
-            Wt = W_star // PATCH_SIZE
-
-            # Clip on the *global* token grid edges (important near bottom/right)
-            if y0_tok >= out_h or x0_tok >= out_w:
-                continue
-            Ht = min(Ht, out_h - y0_tok)
-            Wt = min(Wt, out_w - x0_tok)
-            if Ht <= 0 or Wt <= 0:
-                continue
-
-            feat = extract_embeddings(model, x.unsqueeze(0))  # (C,Ht0,Wt0) where Ht0/Wt0 match H_star/W_star
-            C, Ht0, Wt0 = feat.shape
-
-            # Also clip feature maps to the clipped Ht/Wt (if we had to clip to global grid)
-            if Ht0 != Ht or Wt0 != Wt:
-                feat = feat[:, :Ht, :Wt]
-                Ht0, Wt0 = Ht, Wt
-
-            # subtract positional template if available
-            if pos_template is not None:
-                feat = feat - pos_template[:, :Ht0, :Wt0]
-
-            tokens = flatten_tokens(feat)  # (Ht*Wt,C)
-            tokens = tokens - tokens.mean(axis=0, keepdims=True)
-
-            pcs = pca.transform(tokens).astype(np.float32).reshape(Ht0, Wt0, N_PC)  # (Ht,Wt,3)
-
-            # blend weights for this token shape
-            blend = hann2d(Ht0, Wt0)
-
-            # accumulate
-            for k in range(N_PC):
-                acc[k, y0_tok:y0_tok+Ht0, x0_tok:x0_tok+Wt0] += pcs[..., k] * blend
-            wgt[y0_tok:y0_tok+Ht0, x0_tok:x0_tok+Wt0] += blend
-
-            wrote_windows += 1
-            if wrote_windows % 50 == 0:
-                print(f"Blend: wrote {wrote_windows} windows (scanned {i}/{len(windows)})")
-
-        # normalize
-        acc /= np.maximum(wgt, 1e-6)
-        print(f"PASS2 blended {wrote_windows} windows in {time.time()-t2:.1f}s.")
-
-        # -------------------------------------------------------
-        # Visualization scaling (global, robust percentiles)
-        # -------------------------------------------------------
-        vis = np.zeros_like(acc, dtype=np.uint8)
-        for k in range(N_PC):
-            # mask out never-touched cells (should be rare with edge coverage)
-            valid = wgt > 0
-            vals = acc[k][valid] if np.any(valid) else acc[k].ravel()
-            lo, hi = robust_lo_hi(vals, lo_p=scale_lo_pct, hi_p=scale_hi_pct)
-            band = np.clip((acc[k] - lo) / (hi - lo), 0.0, 1.0)
-            vis[k] = (band * 255.0).round().astype(np.uint8)
-
-        # -------------------------------------------------------
-        # Write GeoTIFF in token grid space
-        # -------------------------------------------------------
+        # increase pixel size by patch size
         out_transform = src.transform * Affine.scale(PATCH_SIZE, PATCH_SIZE)
+
         profile = src.profile.copy()
         profile.update(
-            dtype="uint8",
-            count=N_PC,
-            height=out_h,
-            width=out_w,
+            dtype="uint8",        # visualization product in 0..255
+            count=N_PC,           # 3 bands (PC1, PC2, PC3 after viz mapping)
             transform=out_transform,
+            width=out_w,
+            height=out_h,
             nodata=None,
             compress="lzw",
             tiled=True,
@@ -418,22 +309,81 @@ def infer_overlap_blend_possub(
             blockysize=512,
             BIGTIFF="YES",
         )
-
         with rasterio.open(out_path, "w", **profile) as dst:
-            for k in range(N_PC):
-                dst.write(vis[k], k + 1)
+            # optional: initialize bands with zeros
+            for b in range(1, N_PC + 1):
+                dst.write(np.zeros((out_h, out_w), dtype=np.uint8), b)
+
+            # ------------------------------------------------
+            # PASS 2: Transform each window → viz → write
+            # ------------------------------------------------
+            for i, win in enumerate(windows, 1):
+
+                # skip windows where every pixel in every band is 0.0
+                arr = src.read([1, 2, 3], window=win)
+                if not np.any(arr):
+                    continue
+
+                # compute location in token grid
+                y0_tok = win.row_off // PATCH_SIZE
+                x0_tok = win.col_off // PATCH_SIZE
+                assert win.row_off % PATCH_SIZE == 0 and win.col_off % PATCH_SIZE == 0, (win.row_off, win.col_off)
+
+
+                # get features for the current window
+                x = window_to_tensor(src, win, debug=False).unsqueeze(0)   # (1, 3, H*, W*)
+                feat = extract_embeddings(model, x)           # (C, Ht, Wt)
+                C, Ht, Wt = feat.shape
+                tokens = (
+                    feat.permute(1, 2, 0)                     # (Ht, Wt, C)
+                        .reshape(Ht * Wt, C)                  # (N_tokens, C)
+                        .detach().cpu().numpy()
+                        .astype(np.float32, copy=False)
+                )
+                # assert
+                Ht_expected = x.shape[-2] // PATCH_SIZE
+                Wt_expected = x.shape[-1] // PATCH_SIZE
+                assert (Ht, Wt) == (Ht_expected, Wt_expected), (Ht, Wt, Ht_expected, Wt_expected)
+
+                # Apply PCAs to compress embeddings
+                pcs = pca.transform(tokens)                         # (N_tokens, N_PC)
+                pcs = pcs.astype(np.float32).reshape(Ht, Wt, N_PC)  # (Ht, Wt, N_PC)
+
+                # # multiply by 2 and pass through sigmoid to convert [0,1] → [0,255] 
+                # pcs_t = torch.from_numpy(pcs)                                         # H, W, 3
+                # vis = torch.sigmoid(pcs_t.mul(2.0)).permute(2, 0, 1)                  # 3, H, W 
+                # vis_u8 = (vis.clamp(0, 1) * 255.0).round().to(torch.uint8).numpy()
+                
+                # another way of visualizing to confirm sigmoid isnt creating checkers
+                pcs_vis = np.empty_like(pcs, dtype=np.float32)
+                for k in range(N_PC):
+                    pc = pcs[..., k]
+                    lo, hi = pc.min(), pc.max()
+                    pcs_vis[..., k] = 0.0 if hi <= lo else (pc - lo) / (hi - lo)
+
+                vis_u8 = (pcs_vis.transpose(2, 0, 1) * 255).round().astype(np.uint8)
+
+                # clip to raster edges on token grid (border windows)
+                y1_tok = min(y0_tok + Ht, out_h)
+                x1_tok = min(x0_tok + Wt, out_w)
+                h_write = y1_tok - y0_tok
+                w_write = x1_tok - x0_tok
+                if h_write <= 0 or w_write <= 0:
+                    continue
+
+                win_tok = Window(x0_tok, y0_tok, w_write, h_write)
+                print("--DEBUG WIN--")
+                print(win, float(pcs.mean()), float(pcs.std()))
+                print(win_tok)
+                for b in range(N_PC):
+                    dst.write(vis_u8[b, :h_write, :w_write], b + 1, window=win_tok)
+
+                if i % 10 == 0:
+                    print(f"Writing {i}/{len(windows)} windows -> token win "
+                          f"(y={y0_tok}:{y1_tok}, x={x0_tok}:{x1_tok}) size=({Ht},{Wt})")
 
         print("Done. Wrote:", out_path)
         return out_path
-
-
-# -------------------- RUN --------------------
-if __name__ == "__main__":
-    infer_overlap_blend_possub(
-        "../data/kev_2023-07-21_cropped.tif",
-        "../data/kev_2023-07-21_pca_overlap_blend_possub.tif",
-        pos_template_max_windows=200,
-        pca_sample_per_window=256,
-        scale_lo_pct=2.0,
-        scale_hi_pct=98.0,
-    )
+    
+# if __name__ == "__main__":
+#     main(INPUT_TIF)
